@@ -482,10 +482,40 @@ knn_pred_raw <- knn(train = train_x, test = test_x,
 # winning class. Convert to probability of class 1 (Pass).
 knn_prob_win <- attr(knn_pred_raw, "prob")
 knn_prob_1   <- ifelse(knn_pred_raw == 1, knn_prob_win, 1 - knn_prob_win)
-knn_pred     <- as.integer(as.character(knn_pred_raw))
 
+# --- 4d.v. Tune the kNN VOTE-threshold on TRAINING votes only -------
+# Mirrors the logistic threshold tuning: at the default 0.5 majority
+# vote, kNN collapses to an all-Pass classifier under this ~85/15
+# imbalance (specificity 0), which is an unfair comparison against the
+# threshold-tuned logistic model. We therefore pick the vote-threshold
+# that maximizes balanced accuracy on the TRAINING set's own vote
+# proportions, then apply it ONCE to the frozen test set. Using
+# test = train_x lets each training point count itself among its
+# neighbors (mildly optimistic) - this is the proper analog of
+# logistic's in-sample-train threshold and is leakage-free w.r.t. test.
+# HONEST CAVEAT: the kNN vote proportion is a COARSE probability - at
+# k = 25 it takes only k + 1 = 26 discrete values (j/25) - so this
+# threshold is far less granular than logistic's, but it still yields a
+# meaningful sensitivity/specificity trade-off instead of all-Pass.
+set.seed(123)
+knn_train_raw    <- knn(train = train_x, test = train_x,
+                        cl = train_y, k = best_k, prob = TRUE)
+knn_train_win    <- attr(knn_train_raw, "prob")
+knn_prob_1_train <- ifelse(knn_train_raw == 1, knn_train_win, 1 - knn_train_win)
+knn_ba_train <- sapply(thresholds, function(t) {
+  pr <- as.integer(knn_prob_1_train > t)
+  TP <- sum(pr == 1 & train_y == 1); FN <- sum(pr == 0 & train_y == 1)
+  TN <- sum(pr == 0 & train_y == 0); FP <- sum(pr == 1 & train_y == 0)
+  ((TP / (TP + FN)) + (TN / (TN + FP))) / 2
+})
+knn_best_t <- thresholds[which.max(knn_ba_train)]
+cat(sprintf("\nkNN train-selected vote-threshold (max balanced accuracy): %.2f\n",
+            knn_best_t))
+
+knn_pred     <- as.integer(knn_prob_1 > knn_best_t)
 knn_metrics  <- get_metrics(test_y, knn_pred, knn_prob_1,
-                            sprintf("kNN (CV-tuned k = %d)", best_k))
+                            sprintf("kNN (k = %d, tuned vote-thr = %.2f)",
+                                    best_k, knn_best_t))
 
 # ============================================================
 # 4e. Naive baseline on the SAME test set
@@ -560,6 +590,161 @@ cat("\n--- HONEST GAP SUMMARY (CV vs test vs baseline) ---\n")
 print(honest_gap, row.names = FALSE)
 write.csv(honest_gap, "table_honest_gap.csv", row.names = FALSE)
 
+# ===================================================================
+# SECTION 6 - REPEATED STRATIFIED CROSS-VALIDATION (robust headline)
+# ===================================================================
+# WHY repeated CV is more reliable than a single split for n = 649:
+#   A single 80/20 split reports metrics on ONE arbitrary set of ~129
+#   test students. With a ~85/15 class imbalance that test fold holds
+#   only ~19 failing students, so a handful of them landing on the
+#   wrong side of the decision boundary swings sensitivity/specificity
+#   wildly - this is exactly why the single-split logistic TEST AUC can
+#   look far worse than its CV AUC: the test fold was simply an unlucky
+#   draw. Repeated stratified k-fold CV instead evaluates EVERY student
+#   exactly once per repeat and averages over 40 different train/test
+#   partitions, so the reported mean barely depends on any single
+#   partition and the SD directly quantifies how stable each metric is.
+#   Stratification holds the ~15% fail rate constant in every fold.
+#   The ENTIRE procedure - stepwise selection, per-fold min-max scaling,
+#   and the decision threshold - is re-derived inside each fold's
+#   TRAINING portion only, so no held-out fold ever informs selection,
+#   scaling, or thresholding (same leakage discipline as Section 4).
+# ===================================================================
+cat("\n====================================================\n")
+cat("SECTION 6 - REPEATED STRATIFIED CROSS-VALIDATION\n")
+cat("====================================================\n")
+
+# Compact, SILENT metric helper (avoids printing 80 confusion matrices).
+cv_metrics <- function(actual, pred, prob) {
+  TP <- sum(pred == 1 & actual == 1); FN <- sum(pred == 0 & actual == 1)
+  TN <- sum(pred == 0 & actual == 0); FP <- sum(pred == 1 & actual == 0)
+  sens <- TP / (TP + FN); spec <- TN / (TN + FP)
+  acc  <- (TP + TN) / length(actual)
+  bal  <- (sens + spec) / 2
+  auc_val <- as.numeric(auc(roc(actual, prob, quiet = TRUE, direction = "<")))
+  c(auc = auc_val, accuracy = acc, sensitivity = sens,
+    specificity = spec, balanced_accuracy = bal)
+}
+
+n_repeats <- 4
+k_folds   <- 10
+log_rows  <- list()      # per-fold logistic metric vectors
+knn_rows  <- list()      # per-fold kNN metric vectors
+log_thr   <- numeric(0)  # per-fold selected logistic threshold
+knn_thr   <- numeric(0)  # per-fold selected kNN vote-threshold
+
+for (r in seq_len(n_repeats)) {
+  set.seed(100 + r)      # reproducible, distinct partition per repeat
+  folds_r <- createFolds(df_glm$target_pass, k = k_folds,
+                         list = TRUE, returnTrain = FALSE)
+  for (f in seq_along(folds_r)) {
+    te <- folds_r[[f]]
+
+    ## ---- Logistic: stepwise + threshold, all INSIDE fold-train ----
+    g_tr <- df_glm[-te, ]; g_te <- df_glm[te, ]
+    fit_full <- glm(target_pass ~ ., data = g_tr, family = "binomial")
+    fit_step <- step(fit_full, direction = "both", trace = 0)
+    # Threshold re-derived from fold-TRAIN fitted probabilities only.
+    # NOTE: this is the in-sample-train threshold - leakage-free w.r.t.
+    # the held-out fold, but mildly optimistic for the threshold itself.
+    # A nested inner-CV threshold would be the stricter alternative;
+    # deliberately omitted here as overkill for a project of this size.
+    p_tr  <- predict(fit_step, type = "response")
+    ba_tr <- sapply(thresholds, function(t) {
+      pr <- as.integer(p_tr > t)
+      TP <- sum(pr == 1 & g_tr$target_pass == 1)
+      FN <- sum(pr == 0 & g_tr$target_pass == 1)
+      TN <- sum(pr == 0 & g_tr$target_pass == 0)
+      FP <- sum(pr == 1 & g_tr$target_pass == 0)
+      ((TP / (TP + FN)) + (TN / (TN + FP))) / 2
+    })
+    t_fold  <- thresholds[which.max(ba_tr)]
+    log_thr <- c(log_thr, t_fold)
+    p_te    <- predict(fit_step, newdata = g_te, type = "response")
+    log_rows[[length(log_rows) + 1]] <-
+      cv_metrics(g_te$target_pass, as.integer(p_te > t_fold), p_te)
+
+    ## ---- kNN: min-max FIT on fold-train only; k held FIXED --------
+    # k is held FIXED at best_k (the k already CV-selected in Section 4d).
+    # Nested per-fold re-tuning of k would be the stricter alternative;
+    # omitted by design. Per fold we refit BOTH the min-max scaling and
+    # the kNN vote-threshold (below) on the fold-TRAIN portion only.
+    k_tr <- df_knn[-te, ]; k_te <- df_knn[te, ]
+    mn <- sapply(k_tr[, cont_ord_vars], min)
+    mx <- sapply(k_tr[, cont_ord_vars], max)
+    k_tr_s <- scale_with_train_range(k_tr, cont_ord_vars, mn, mx)
+    k_te_s <- scale_with_train_range(k_te, cont_ord_vars, mn, mx)
+    set.seed(100 + r)    # reproducible tie-breaking in knn()
+    pr_raw <- knn(train = k_tr_s[, feature_cols],
+                  test  = k_te_s[, feature_cols],
+                  cl = k_tr_s$target_pass, k = best_k, prob = TRUE)
+    pw <- attr(pr_raw, "prob")
+    p1 <- ifelse(pr_raw == 1, pw, 1 - pw)          # Pass-vote prop (held-out)
+    # Tune the kNN vote-threshold on the fold-TRAIN votes only (same
+    # balanced-accuracy criterion / leakage discipline as logistic).
+    # The vote proportion is a COARSE probability (only k + 1 discrete
+    # values at k = best_k), so this threshold is less granular than
+    # logistic's, but it avoids the degenerate all-Pass majority vote.
+    set.seed(100 + r)
+    pr_tr  <- knn(train = k_tr_s[, feature_cols],
+                  test  = k_tr_s[, feature_cols],
+                  cl = k_tr_s$target_pass, k = best_k, prob = TRUE)
+    pw_tr  <- attr(pr_tr, "prob")
+    p1_tr  <- ifelse(pr_tr == 1, pw_tr, 1 - pw_tr)
+    yk_tr  <- k_tr_s$target_pass
+    ba_ktr <- sapply(thresholds, function(t) {
+      pr <- as.integer(p1_tr > t)
+      TP <- sum(pr == 1 & yk_tr == 1); FN <- sum(pr == 0 & yk_tr == 1)
+      TN <- sum(pr == 0 & yk_tr == 0); FP <- sum(pr == 1 & yk_tr == 0)
+      ((TP / (TP + FN)) + (TN / (TN + FP))) / 2
+    })
+    tk_fold <- thresholds[which.max(ba_ktr)]
+    knn_thr <- c(knn_thr, tk_fold)
+    knn_rows[[length(knn_rows) + 1]] <-
+      cv_metrics(k_te_s$target_pass, as.integer(p1 > tk_fold), p1)
+  }
+}
+
+log_mat <- do.call(rbind, log_rows)
+knn_mat <- do.call(rbind, knn_rows)
+
+summarise_cv <- function(mat, model) {
+  m <- colMeans(mat); s <- apply(mat, 2, sd)
+  data.frame(
+    Model     = model,
+    Metric    = c("AUC", "Accuracy", "Sensitivity",
+                  "Specificity", "Balanced Acc."),
+    Mean      = round(m, 4),
+    SD        = round(s, 4),
+    Mean_pm_SD = sprintf("%.3f +/- %.3f", m, s),
+    row.names = NULL, check.names = FALSE
+  )
+}
+
+repeated_cv_results <- rbind(
+  summarise_cv(log_mat, "Logistic Regression (stepwise)"),
+  summarise_cv(knn_mat, sprintf("kNN (k = %d, tuned vote-thr)", best_k))
+)
+
+cat(sprintf("\nProtocol: %d repeats x %d-fold stratified CV = %d folds, full data (n = %d).\n",
+            n_repeats, k_folds, n_repeats * k_folds, nrow(df_glm)))
+cat("Stepwise selection, min-max scaling, and thresholding all re-run\n")
+cat("inside each fold's TRAINING portion (leakage-free).\n\n")
+print(repeated_cv_results, row.names = FALSE)
+write.csv(repeated_cv_results, "table_repeated_cv_results.csv",
+          row.names = FALSE)
+
+# --- Threshold stability across the 40 resamples ----------------
+# Shows how robust the single-split threshold choice is to resampling.
+cat(sprintf("\nLogistic per-fold selected threshold: mean = %.3f, SD = %.3f, range [%.2f, %.2f]\n",
+            mean(log_thr), sd(log_thr), min(log_thr), max(log_thr)))
+cat(sprintf("(Single-split choice was %.2f; the spread above shows how stable that pick is across the 40 resamples.)\n",
+            best_t))
+cat(sprintf("kNN      per-fold selected vote-threshold: mean = %.3f, SD = %.3f, range [%.2f, %.2f]\n",
+            mean(knn_thr), sd(knn_thr), min(knn_thr), max(knn_thr)))
+cat("(kNN's vote proportion is coarse, so its threshold - and the resulting\n")
+cat(" specificity - is expected to be chunkier / less stable than logistic's.)\n")
+
 # --- Concluding numbers for the report --------------------------
 cat("\n====================================================\n")
 cat("CONCLUSION POINTS FOR REPORT\n")
@@ -570,6 +755,13 @@ cat(sprintf("- Logistic test accuracy   : %.2f%%   (CV AUC %.3f, test AUC %.3f)\
             log_metrics$accuracy * 100, cv_auc_log, log_metrics$auc))
 cat(sprintf("- kNN test accuracy        : %.2f%%   (CV AUC %.3f, test AUC %.3f)\n",
             knn_metrics$accuracy * 100, cv_auc_knn, knn_metrics$auc))
+cat("\n- ROBUST HEADLINE (4x10 repeated stratified CV, mean +/- SD):\n")
+cat(sprintf("    Logistic AUC : %.3f +/- %.3f   |  Balanced Acc : %.3f +/- %.3f\n",
+            mean(log_mat[, "auc"]), sd(log_mat[, "auc"]),
+            mean(log_mat[, "balanced_accuracy"]), sd(log_mat[, "balanced_accuracy"])))
+cat(sprintf("    kNN AUC      : %.3f +/- %.3f   |  Balanced Acc : %.3f +/- %.3f\n",
+            mean(knn_mat[, "auc"]), sd(knn_mat[, "auc"]),
+            mean(knn_mat[, "balanced_accuracy"]), sd(knn_mat[, "balanced_accuracy"])))
 cat("\nKEY MESSAGE: Without G1/G2, social/demographic variables\n")
 cat("provide LIMITED predictive power above the naive baseline.\n")
 cat("This is CONSISTENT with Cortez & Silva (2008) Setup C results.\n")
@@ -583,6 +775,7 @@ cat("  - table_correlation_matrix.csv\n")
 cat("  - tables_frequency.txt\n")
 cat("  - table_final_results.csv\n")
 cat("  - table_honest_gap.csv\n")
+cat("  - table_repeated_cv_results.csv\n")
 cat("  - table_logistic_coefficients.csv\n")
 cat("  - plot1_absences_histogram.pdf\n")
 cat("  - plot2_alcohol_boxplot.pdf\n")
