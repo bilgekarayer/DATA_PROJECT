@@ -1,0 +1,4 @@
+"Model","CV_AUC","Test_AUC","Test_Accuracy","Baseline_Acc"
+"Logistic Regression (stepwise)",0.8401,0.6628,0.6977,0.7752
+"kNN (k = 25)",0.7711,0.794,0.7752,0.7752
+"Baseline (always Pass)",0.5,0.5,0.7752,0.7752

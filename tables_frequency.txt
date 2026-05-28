@@ -1,0 +1,85 @@
+
+-- school --
+
+ GP  MS 
+423 226 
+
+-- sex --
+
+  F   M 
+383 266 
+
+-- address --
+
+  R   U 
+197 452 
+
+-- famsize --
+
+GT3 LE3 
+457 192 
+
+-- Pstatus --
+
+  A   T 
+ 80 569 
+
+-- Mjob --
+
+ at_home   health    other services  teacher 
+     135       48      258      136       72 
+
+-- Fjob --
+
+ at_home   health    other services  teacher 
+      42       23      367      181       36 
+
+-- reason --
+
+    course       home      other reputation 
+       285        149         72        143 
+
+-- guardian --
+
+father mother  other 
+   153    455     41 
+
+-- schoolsup --
+
+ no yes 
+581  68 
+
+-- famsup --
+
+ no yes 
+251 398 
+
+-- paid --
+
+ no yes 
+610  39 
+
+-- activities --
+
+ no yes 
+334 315 
+
+-- nursery --
+
+ no yes 
+128 521 
+
+-- higher --
+
+ no yes 
+ 69 580 
+
+-- internet --
+
+ no yes 
+151 498 
+
+-- romantic --
+
+ no yes 
+410 239 
